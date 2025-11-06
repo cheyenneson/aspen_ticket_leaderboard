@@ -43,10 +43,12 @@ async function fetchGoogleSheetsData() {
 
     const sheets = google.sheets({ version: 'v4', auth })
     
-    // Fetch data from the sheet - adjust range as needed
+    // Fetch data from the sheet
+    // Columns: Event Name, Event ID, Order #, Order Date, First Name, Last Name, 
+    // Email, Location 1, Location 2, Location 3, Attendee Status, Which company dancer referred you?
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEETS_ID,
-      range: 'Sheet1!A:L', // Adjust range to match your sheet
+      range: 'Tickets!A:L', // A through L for 12 columns
     })
 
     const rows = response.data.values || []
@@ -57,7 +59,7 @@ async function fetchGoogleSheetsData() {
     // Parse the rows into structured data
     const tickets = []
     dataRows.forEach(row => {
-      if (row.length >= 12) {
+      if (row.length >= 11) { // At least through Attendee Status
         const [
           eventName,
           eventId,
@@ -66,24 +68,28 @@ async function fetchGoogleSheetsData() {
           firstName,
           lastName,
           email,
-          quantity,
-          section,
-          seat,
-          status,
-          referrer
+          location1,
+          location2,
+          location3,
+          attendeeStatus,
+          referrer // Index 11, may not exist for all rows
         ] = row
 
         // Only include attending tickets
-        if (status && status.toLowerCase().includes('attending')) {
+        if (attendeeStatus && attendeeStatus.toLowerCase().includes('attending')) {
+          // Use Location 3 as the primary seat identifier (appears to be the seat number)
+          const seat = location3?.trim()
+          const referrerValue = referrer?.trim()
+          
           tickets.push({
             eventId: eventId?.trim(),
             orderId: orderId?.trim(),
-            seat: seat?.trim(),
+            seat: seat,
             firstName: firstName?.trim(),
             lastName: lastName?.trim(),
             email: email?.trim(),
-            status: status?.trim(),
-            referrer: referrer?.trim(),
+            status: attendeeStatus?.trim(),
+            referrer: referrerValue && referrerValue !== '' ? referrerValue : null,
             source: 'sheets'
           })
         }
@@ -105,9 +111,12 @@ app.get('/api/tickets', async (req, res) => {
       throw new Error('EVENTBRITE_TOKEN not configured. Run: firebase functions:config:set eventbrite.token="YOUR_TOKEN"')
     }
 
+    // Check for cache bypass parameter
+    const bypassCache = req.query.nocache === 'true' || req.query.refresh === 'true'
+
     // Check if we have valid cached data
     const now = Date.now()
-    if (cachedData && cacheTimestamp && (now - cacheTimestamp < CACHE_DURATION)) {
+    if (!bypassCache && cachedData && cacheTimestamp && (now - cacheTimestamp < CACHE_DURATION)) {
       console.log('Returning cached data')
       return res.json({
         ...cachedData,
@@ -194,31 +203,54 @@ app.get('/api/tickets', async (req, res) => {
     console.log(`Fetched ${eventbriteTickets.length} tickets from Eventbrite, ${sheetsTickets.length} from Google Sheets`)
 
     // Merge and deduplicate tickets
-    // Use a Map with orderId-seat as the key to track unique tickets
-    const ticketMap = new Map()
+    // Strategy: Eventbrite is the source of truth for tickets
+    // Google Sheets is used to UPDATE referrer information for existing orders
     
-    // First, add Eventbrite tickets
-    eventbriteTickets.forEach(ticket => {
-      const key = `${ticket.orderId}-${ticket.seat || 'unknown'}`
-      ticketMap.set(key, ticket)
-    })
-
-    // Then, add/update with Google Sheets tickets (they take priority for referrer data)
+    // Create a map of Order ID -> Referrer from Google Sheets
+    const sheetsReferrerMap = new Map()
     sheetsTickets.forEach(ticket => {
-      const key = `${ticket.orderId}-${ticket.seat || 'unknown'}`
-      const existingTicket = ticketMap.get(key)
-      
-      if (existingTicket) {
-        // Update existing ticket with Google Sheets referrer (if it has one)
-        if (ticket.referrer) {
-          existingTicket.referrer = ticket.referrer
-          existingTicket.source = 'sheets' // Mark as updated from sheets
-        }
-      } else {
-        // Add new ticket from sheets
-        ticketMap.set(key, ticket)
+      if (ticket.referrer && ticket.orderId) {
+        // Store the referrer for this order ID
+        sheetsReferrerMap.set(ticket.orderId, ticket.referrer)
       }
     })
+    
+    console.log(`Found referrer updates for ${sheetsReferrerMap.size} orders in Google Sheets`)
+    
+    const ticketMap = new Map()
+    let updatedCount = 0
+    
+    // Add ALL Eventbrite tickets (source of truth)
+    eventbriteTickets.forEach((ticket, index) => {
+      const key = `eventbrite-${ticket.orderId}-${index}`
+      
+      // Check if Google Sheets has a referrer update for this order
+      if (sheetsReferrerMap.has(ticket.orderId)) {
+        const updatedReferrer = sheetsReferrerMap.get(ticket.orderId)
+        if (updatedReferrer !== ticket.referrer) {
+          ticket.referrer = updatedReferrer
+          updatedCount++
+        }
+      }
+      
+      ticketMap.set(key, ticket)
+    })
+    
+    console.log(`Updated ${updatedCount} Eventbrite tickets with referrer info from Google Sheets`)
+
+    // Add any tickets from Google Sheets that don't exist in Eventbrite
+    const eventbriteOrderIds = new Set(eventbriteTickets.map(t => t.orderId))
+    let newFromSheetsCount = 0
+    
+    sheetsTickets.forEach((ticket, index) => {
+      if (!eventbriteOrderIds.has(ticket.orderId)) {
+        const key = `sheets-${ticket.orderId}-${ticket.seat || index}`
+        ticketMap.set(key, ticket)
+        newFromSheetsCount++
+      }
+    })
+    
+    console.log(`Added ${newFromSheetsCount} new tickets from Google Sheets not in Eventbrite`)
 
     // Count tickets per dancer
     const dancerTickets = {}
@@ -226,10 +258,14 @@ app.get('/api/tickets', async (req, res) => {
 
     ticketMap.forEach(ticket => {
       if (ticket.referrer) {
-        if (!dancerTickets[ticket.referrer]) {
-          dancerTickets[ticket.referrer] = 0
+        // Skip N/A and null/empty referrers
+        const referrerLower = ticket.referrer.toLowerCase().trim()
+        if (referrerLower !== 'n/a' && referrerLower !== '') {
+          if (!dancerTickets[ticket.referrer]) {
+            dancerTickets[ticket.referrer] = 0
+          }
+          dancerTickets[ticket.referrer]++
         }
-        dancerTickets[ticket.referrer]++
       }
     })
 
@@ -243,17 +279,10 @@ app.get('/api/tickets', async (req, res) => {
 
     // Calculate some stats about data sources
     let eventbriteCount = 0
-    let sheetsCount = 0
-    let updatedBySheetsCount = 0
+    let sheetsOnlyCount = 0
     ticketMap.forEach(ticket => {
       if (ticket.source === 'eventbrite') eventbriteCount++
-      else if (ticket.source === 'sheets') {
-        sheetsCount++
-        // Check if it was an update (exists in both)
-        if (eventbriteTickets.some(et => `${et.orderId}-${et.seat || 'unknown'}` === `${ticket.orderId}-${ticket.seat || 'unknown'}`)) {
-          updatedBySheetsCount++
-        }
-      }
+      else if (ticket.source === 'sheets') sheetsOnlyCount++
     })
 
     const responseData = {
@@ -263,9 +292,9 @@ app.get('/api/tickets', async (req, res) => {
       lastUpdated: new Date().toISOString(),
       cached: false,
       dataSources: {
-        eventbrite: eventbriteCount,
-        sheets: sheetsCount - updatedBySheetsCount, // Only count new tickets from sheets
-        updatedBySheets: updatedBySheetsCount
+        fromEventbrite: eventbriteCount, // All tickets from Eventbrite (some may have updated referrers)
+        onlyInSheets: sheetsOnlyCount, // Tickets only in Google Sheets (not in Eventbrite)
+        referrersUpdated: updatedCount // How many Eventbrite tickets had referrer updated from Sheets
       }
     }
 

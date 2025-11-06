@@ -17,7 +17,7 @@ function App() {
         const isProduction = window.location.hostname !== 'localhost'
         const apiUrl = isProduction 
           ? '/api'  // Use relative path in production (Firebase rewrites to function)
-          : 'http://localhost:3001/api'  // Use local server in development
+          : 'http://127.0.0.1:5001/aspen-leaderboard/us-central1/api/api'  // Use Firebase emulator in development
         
         console.log('Fetching from:', apiUrl)
         const response = await fetch(`${apiUrl}/tickets`)
